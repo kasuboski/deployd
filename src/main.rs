@@ -1,7 +1,10 @@
 use anyhow::Result;
+use server::Server;
 use tokio::fs::{self};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
+use std::net::SocketAddr;
+use std::str::FromStr;
 
 use futures::{future, FutureExt, StreamExt};
 use std::env;
@@ -10,10 +13,7 @@ use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
 use tokio_stream::wrappers::{IntervalStream, TcpListenerStream};
 
-#[derive(Debug, Clone)]
-pub struct Server {
-    addr: String,
-}
+mod server;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -59,7 +59,9 @@ async fn main() -> Result<()> {
 async fn config_server() -> Result<Server> {
     let read = fs::read_to_string("./server").await?;
     let server_addr = read.trim();
+    let server_addr = SocketAddr::from_str(server_addr)?;
     Ok(Server {
-        addr: server_addr.into(),
+        name: "server".into(),
+        addr: server_addr,
     })
 }
