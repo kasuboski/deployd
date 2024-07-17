@@ -11,6 +11,7 @@ use bollard::secret::MountTypeEnum;
 use bollard::secret::PortBinding;
 use bollard::secret::RestartPolicy;
 use bollard::secret::RestartPolicyNameEnum;
+use fasthash::MetroHasher;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -23,33 +24,9 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone)]
-pub struct Server {
-    pub name: String,
-    pub addr: SocketAddr,
-    service: Service,
-}
+pub mod desired_state;
 
-#[derive(Debug, Clone, Default)]
-pub struct Service {
-    pub name: String,
-    pub port: u16,
-    pub image: String,
-    pub env: Option<Vec<String>>,
-    pub volume_mapping: Option<VolumeMapping>,
-}
-
-#[derive(Debug, Clone)]
-pub struct VolumeMapping {
-    pub source: String,
-    pub destination: String,
-}
-
-impl Display for VolumeMapping {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{}:{}", self.source, self.destination)
-    }
-}
+use self::desired_state::DesiredState;
 
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -61,9 +38,39 @@ pub enum ServerError {
     IpsExhausted,
     #[error("server {0} not found")]
     ServerNotFound(String),
+    #[error("the server didn't get an ip before trying to run")]
+    ServerMissingIP,
 }
 
 type ServerResult<T> = Result<T, ServerError>;
+
+#[derive(Debug, Clone)]
+pub struct Server {
+    pub name: String,
+    pub addr: Option<SocketAddr>,
+    service: Service,
+}
+
+#[derive(Debug, Clone, Hash)]
+pub struct VolumeMapping {
+    pub source: String,
+    pub destination: String,
+}
+
+impl Display for VolumeMapping {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "{}:{}", self.source, self.destination)
+    }
+}
+
+#[derive(Debug, Clone, Default, Hash)]
+pub struct Service {
+    pub name: String,
+    pub port: u16,
+    pub image: String,
+    pub env: Option<Vec<String>>,
+    pub volume_mapping: Option<VolumeMapping>,
+}
 
 impl Service {
     pub async fn with_env_file(self, path: impl AsRef<Path>) -> ServerResult<Self> {
@@ -165,36 +172,35 @@ impl Default for IpProvisioner {
 }
 
 #[derive(Debug, Clone, Default)]
-struct Identifier(u64);
+struct Identifier;
 
 impl Identifier {
-    fn get(&mut self) -> String {
-        let ret = self.0.to_string();
-        self.0 += 1;
-        ret
+    fn get(svc: &Service) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = MetroHasher::default();
+        svc.hash(&mut h);
+        let ret = h.finish();
+        bs58::encode(ret.to_le_bytes()).into_string()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Runner {
     ips: IpProvisioner,
-    containers: HashMap<String, Server>,
+    desired: DesiredState,
     docker: bollard::Docker,
-    identifier: Identifier,
 }
 
 impl Runner {
     pub fn new() -> ServerResult<Self> {
         let docker = bollard::Docker::connect_with_defaults()?;
-        let containers = HashMap::default();
+        let desired = DesiredState::default();
         let ips = IpProvisioner::default();
-        let identifier = Identifier::default();
 
         Ok(Self {
             ips,
             docker,
-            containers,
-            identifier,
+            desired,
         })
     }
 
@@ -222,22 +228,33 @@ impl Runner {
             })
             .collect();
         debug!(containers = ?container_names.iter().cloned().collect::<Vec<String>>(), "found containers");
+
+        // find services with multiple servers
+        // if new server is running delete the old one(s)
+        let to_remove = self.old_servers(&container_names);
+        if !to_remove.is_empty() {
+            debug!(servers = ?to_remove, "found old versions of servers to remove");
+        }
+        for s in to_remove {
+            self.desired.remove_server(s);
+        }
+
         // compare with desired containers
         let mut not_found: Vec<String> = Vec::with_capacity(container_names.len());
-        for name in self.containers.keys() {
+        for name in self.desired.server_names() {
             let found = container_names.remove(name);
             if !found {
                 not_found.push(name.to_string())
             }
         }
-        // delete extras
+        // stop extras
         for n in &container_names {
             debug!(container = n, "stopping container");
             self.stop(n).await?;
         }
         // create nonexistent
         for nf in &not_found {
-            if self.containers.get(nf).is_none() {
+            if self.desired.get_server(nf).is_none() {
                 // This shouldn't happen as we specifically iterated through containers
                 // to get the not_found
                 continue;
@@ -247,6 +264,25 @@ impl Runner {
         }
 
         Ok(())
+    }
+
+    // old servers are attached to a service and have a newer version running
+    fn old_servers(&mut self, container_names: &HashSet<String>) -> Vec<String> {
+        self.desired
+            .servers()
+            .flat_map(|server_names| {
+                if server_names.len() == 1 {
+                    return vec![];
+                }
+                if let Some(new) = server_names.last() {
+                    if container_names.contains(new) {
+                        return server_names.iter().filter(|n| n != &new).cloned().collect();
+                    }
+                }
+
+                vec![]
+            })
+            .collect()
     }
 
     /// return an ip from 127.0.0.2-254
@@ -265,16 +301,17 @@ impl Runner {
     async fn run_server(&mut self, name: impl Into<String>) -> ServerResult<()> {
         let name = name.into();
         let server = self
-            .containers
-            .get(&name)
+            .desired
+            .get_server(&name)
             .ok_or(ServerError::ServerNotFound(name.clone()))?;
 
         let options = Some(CreateContainerOptions {
             name: &name,
             platform: None,
         });
-        let ip = server.addr.ip();
+        let ip = server.addr.ok_or(ServerError::ServerMissingIP)?.ip();
         let config = server.service.container_config(ip)?;
+        // TODO: need to ensure the image exists
         self.docker.create_container(options, config).await?;
         self.docker
             .start_container(&name, None::<StartContainerOptions<String>>)
@@ -284,30 +321,35 @@ impl Runner {
 
     /// Add the service to be run
     pub fn add(&mut self, service: &Service) -> ServerResult<String> {
-        let id = self.identifier.get();
+        let id = Identifier::get(service);
         let name = Runner::container_name(service.name.clone(), id);
+        // if we already have a server don't reserve an ip
+        if self.desired.get_server(&name).is_some() {
+            debug!(server = name, "server already exists for service");
+            return Ok(name);
+        }
         let ip = self.reserve_ip()?;
         let _ = service.container_config(IpAddr::V4(ip))?;
 
         let server = Server {
             name: name.clone(),
-            addr: SocketAddr::new(ip.into(), service.port),
+            addr: Some(SocketAddr::new(ip.into(), service.port)),
             service: service.clone(),
         };
-        self.containers.insert(name.clone(), server);
+        self.desired.insert(server);
         Ok(name)
     }
 
-    /// Remove the running service from being managed
+    /// Remove the running server from being managed
     pub fn remove(&mut self, name: impl Into<String>) -> ServerResult<bool> {
         let name = name.into();
-        Ok(self.containers.remove(&name).is_some())
+        Ok(self.desired.remove_server(&name).is_some())
     }
 
     /// Stop with the given name. Return whether or not it was actually stopped
-    pub async fn stop(&mut self, name: impl Into<String>) -> ServerResult<bool> {
+    async fn stop(&mut self, name: impl Into<String>) -> ServerResult<bool> {
         let name = name.into();
-        if self.find(&name).await.is_none() {
+        if self.find_container(&name).await.is_none() {
             self.remove_container(&name);
             return Ok(false);
         }
@@ -324,18 +366,20 @@ impl Runner {
         Ok(self.remove_container(&name))
     }
 
-    fn remove_container(&mut self, name: impl ToString) -> bool {
-        let name = name.to_string();
-        if let Some(s) = self.containers.remove(&name) {
-            if let IpAddr::V4(ip) = s.addr.ip() {
-                self.release_ip(ip);
+    fn remove_container(&mut self, name: impl Into<String>) -> bool {
+        let name = name.into();
+        if let Some(s) = self.desired.remove_server(&name) {
+            if let Some(addr) = s.addr {
+                if let IpAddr::V4(ip) = addr.ip() {
+                    self.release_ip(ip);
+                }
             }
             return true;
         }
         false
     }
 
-    pub async fn find(&self, name: &String) -> Option<ContainerSummary> {
+    async fn find_container(&self, name: &String) -> Option<ContainerSummary> {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("name".to_string(), vec![name.to_string()]);
 
@@ -382,7 +426,7 @@ mod test {
     use std::time::Duration;
 
     #[test(tokio::test)]
-    async fn env_file_read() {
+    async fn test_env_file_read() {
         let file = TempFile::new().await.expect("couldn't create tempfile");
         let path = file.file_path();
         fs::write(path, "HELLO=WORLD\nYES=no")
@@ -394,7 +438,7 @@ mod test {
     }
 
     #[test(tokio::test)]
-    async fn service_with_env_file() {
+    async fn test_service_with_env_file() {
         let file = TempFile::new().await.expect("couldn't create tempfile");
         let path = file.file_path();
         fs::write(path, "HELLO=WORLD\nYES=no")
@@ -418,7 +462,7 @@ mod test {
     }
 
     #[test]
-    fn service_to_config() {
+    fn test_service_to_config() {
         let svc = Service {
             name: "test".to_string(),
             port: 8080,
@@ -474,9 +518,34 @@ mod test {
         assert!(ips.reserve_ip().is_ok());
     }
 
-    #[ignore]
-    #[test(tokio::test)]
-    async fn run_service() {
+    #[test]
+    fn test_identifier() {
+        let svc_a = Service {
+            name: "test".to_string(),
+            port: 8080,
+            image: "nginx".to_string(),
+            env: None,
+            volume_mapping: None,
+        };
+
+        let svc_b = Service {
+            name: "test".to_string(),
+            port: 8080,
+            image: "nginx:latest".to_string(),
+            env: None,
+            volume_mapping: None,
+        };
+
+        let a = Identifier::get(&svc_a);
+        let b = Identifier::get(&svc_b);
+
+        assert_ne!(a, b);
+        let aa = Identifier::get(&svc_a);
+        assert_eq!(a, aa);
+    }
+
+    #[test]
+    fn test_old_servers() {
         let mut runner = Runner::new().expect("couldn't create runner");
         let svc = Service {
             name: "test".to_string(),
@@ -486,10 +555,46 @@ mod test {
             volume_mapping: None,
         };
 
-        let name = runner.add(&svc).expect("couldn't add server");
+        let name = runner.add(&svc).expect("couldn't add service");
+        let mut running = HashSet::new();
+        running.insert(name);
+        let found_old = runner.old_servers(&running);
+        assert_eq!(found_old.len(), 0);
+
+        let svc_new = Service {
+            name: "test".to_string(),
+            port: 8080,
+            image: "nginx:1.27.0-alpine".to_string(),
+            env: None,
+            volume_mapping: None,
+        };
+        let name_new = runner.add(&svc_new).expect("couldn't add service");
+        running.insert(name_new);
+
+        debug!(server = ?runner.desired.servers(), "service associated servers");
+
+        let found_old = runner.old_servers(&running);
+        assert_eq!(found_old.len(), 1);
+    }
+
+    #[ignore]
+    #[test(tokio::test)]
+    async fn test_run_server() {
+        let mut runner = Runner::new().expect("couldn't create runner");
+        let svc = Service {
+            name: "test".to_string(),
+            port: 8080,
+            image: "nginx".to_string(),
+            env: None,
+            volume_mapping: None,
+        };
+
+        let name = runner.add(&svc).expect("couldn't add service");
         runner.run_server(&name).await.unwrap();
-        // let docker = bollard::Docker::connect_with_defaults().expect("couldn't create test docker");
-        let info = runner.find(&name).await.expect("error finding container");
+        let info = runner
+            .find_container(&name)
+            .await
+            .expect("error finding container");
         let image = info.image.expect("no image found");
         assert!(image.contains("nginx"));
 
@@ -548,7 +653,7 @@ mod test {
         let svc = Service {
             name: "test".to_string(),
             port: 8080,
-            image: "nginx".to_string(),
+            image: "busybox".to_string(),
             env: None,
             volume_mapping: None,
         };
@@ -558,6 +663,66 @@ mod test {
         assert_eq!(containers.len(), 1);
 
         runner.remove(&name).expect("couldn't remove server");
+        for _ in 0..40 {
+            let _ = runner
+                .reconcile()
+                .await
+                .inspect_err(|e| error!(error = %e, "couldn't reconcile"));
+            sleep(Duration::from_secs(1)).await;
+            if let Ok(containers) = runner.list_containers().await {
+                if containers.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        let containers = runner.list_containers().await.unwrap();
+        assert_eq!(containers.len(), 0);
+
+        let name = runner.add(&svc).expect("couldn't add service");
+        runner.reconcile().await.expect("couldn't reconcile");
+        let containers = runner.list_containers().await.unwrap();
+        assert_eq!(containers.len(), 1);
+
+        let name_2 = runner.add(&svc).expect("couldn't add service");
+        assert_eq!(name, name_2);
+
+        runner.reconcile().await.expect("couldn't reconcile");
+        let containers = runner.list_containers().await.unwrap();
+        assert_eq!(containers.len(), 1);
+
+        let svc_2 = Service {
+            name: "test".to_string(),
+            port: 8080,
+            image: "nginx:1.27.0-alpine".to_string(),
+            env: None,
+            volume_mapping: None,
+        };
+
+        let name_2 = runner.add(&svc_2).expect("couldn't add service");
+        assert_ne!(name, name_2);
+
+        runner.reconcile().await.expect("couldn't reconcile");
+        let containers = runner.list_containers().await.unwrap();
+        assert_eq!(containers.len(), 2);
+
+        runner.remove(&name).expect("couldn't remove server");
+        for _ in 0..40 {
+            let _ = runner
+                .reconcile()
+                .await
+                .inspect_err(|e| error!(error = %e, "couldn't reconcile"));
+            sleep(Duration::from_secs(1)).await;
+            if let Ok(containers) = runner.list_containers().await {
+                if containers.len() == 1 {
+                    break;
+                }
+            }
+        }
+        let containers = runner.list_containers().await.unwrap();
+        assert_eq!(containers.len(), 1);
+
+        runner.remove(&name_2).expect("couldn't remove server");
         for _ in 0..40 {
             let _ = runner
                 .reconcile()
