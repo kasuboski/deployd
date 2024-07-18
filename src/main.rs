@@ -1,5 +1,5 @@
 use anyhow::Result;
-use server::{Runner, Service};
+use server::Runner;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use tokio::fs::{self};
@@ -9,7 +9,7 @@ use tracing::error;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use futures::{future, pin_mut, FutureExt, StreamExt, TryFutureExt};
+use futures::{future, FutureExt, StreamExt};
 use std::env;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -33,7 +33,8 @@ async fn main() -> Result<()> {
 
     let runner = Arc::new(Mutex::new(Runner::new().expect("couldn't create runner")));
     let runner_reconcile = runner.clone();
-    let reconcile_stream = IntervalStream::new(time::interval(Duration::from_millis(250)))
+    let reconcile_interval = Duration::from_millis(500);
+    let reconcile_stream = IntervalStream::new(time::interval(reconcile_interval))
         .for_each(|_| {
             let value = &runner_reconcile;
             async move {

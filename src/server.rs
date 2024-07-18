@@ -44,8 +44,6 @@ pub enum ServerError {
     ServerNotFound(String),
     #[error("the server didn't get an ip before trying to run")]
     ServerMissingIP,
-    #[error("unable to parse the image: {0}")]
-    ImageParseFailure(String),
 }
 
 type ServerResult<T> = Result<T, ServerError>;
@@ -432,6 +430,7 @@ impl Runner {
 
 async fn read_docker_credentials(repo: impl Into<String>) -> Option<DockerCredentials> {
     let mut home = dirs::home_dir()?;
+    home.extend(&[".docker", "config.json"]);
     let contents = fs::read(home).await.ok()?;
     let config: Value = serde_json::from_slice(&contents).ok()?;
     let auths = config.get("auths")?;
@@ -756,7 +755,7 @@ mod test {
             .filter_map(|cs| {
                 cs.names?
                     .first()
-                    .map(|n| n.trim().trim_start_matches("/").to_string())
+                    .map(|n| n.trim().trim_start_matches('/').to_string())
             })
             .any(|c| c.contains(&name_2)));
         let active_server = runner
