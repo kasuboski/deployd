@@ -291,6 +291,13 @@ impl Runner {
             .collect()
     }
 
+    fn latest_server_for_service(&self, service_name: impl Into<String>) -> Option<Server> {
+        self.desired
+            .servers_for_service(service_name)?
+            .last()
+            .cloned()
+    }
+
     /// return an ip from 127.0.0.2-254
     fn reserve_ip(&mut self) -> ServerResult<Ipv4Addr> {
         self.ips.reserve_ip()
@@ -752,6 +759,22 @@ mod test {
         runner.reconcile().await.expect("couldn't reconcile");
         let containers = runner.list_containers().await.unwrap();
         assert_eq!(containers.len(), 2);
+
+        runner.reconcile().await.expect("couldn't reconcile");
+        let containers = runner.list_containers().await.unwrap();
+        assert_eq!(containers.len(), 1);
+        assert!(containers
+            .into_iter()
+            .filter_map(|cs| {
+                cs.names?
+                    .first()
+                    .map(|n| n.trim().trim_start_matches("/").to_string())
+            })
+            .any(|c| c.contains(&name_2)));
+        let active_server = runner
+            .latest_server_for_service("test")
+            .expect("didn't find active server");
+        assert_eq!(active_server.name, name_2);
 
         runner.remove(&name).expect("couldn't remove server");
         for _ in 0..40 {

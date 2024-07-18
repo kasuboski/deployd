@@ -47,6 +47,18 @@ impl DesiredState {
             });
     }
 
+    pub fn servers_for_service(&self, service_name: impl Into<String>) -> Option<Vec<Server>> {
+        let service_name = service_name.into();
+        let server_names = self.services.get(&service_name)?;
+
+        let mut servers: Vec<Server> = Vec::with_capacity(server_names.len());
+        for server_name in server_names {
+            let server = self.get_server(server_name)?;
+            servers.push(server.clone());
+        }
+        Some(servers)
+    }
+
     pub fn remove_server(&mut self, server_name: impl Into<String>) -> Option<Server> {
         let server_name = server_name.into();
 
