@@ -13,8 +13,10 @@ use bollard::secret::MountTypeEnum;
 use bollard::secret::PortBinding;
 use bollard::secret::RestartPolicy;
 use bollard::secret::RestartPolicyNameEnum;
+
 use fasthash::MetroHasher;
 use futures::TryStreamExt;
+use serde::Deserialize;
 use serde_json::Value;
 use std::fmt::Display;
 use std::fmt::Formatter;
@@ -23,6 +25,7 @@ use std::path::Path;
 use thiserror::Error;
 use tokio::{fs, io};
 use tracing::debug;
+use tracing::trace;
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -44,6 +47,8 @@ pub enum ServerError {
     ServerNotFound(String),
     #[error("the server didn't get an ip before trying to run")]
     ServerMissingIP,
+    #[error("couldn't parse the service: {0}")]
+    ServiceParseError(#[from] serde_json::Error),
 }
 
 type ServerResult<T> = Result<T, ServerError>;
@@ -55,7 +60,7 @@ pub struct Server {
     service: Service,
 }
 
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone, Hash, Deserialize)]
 pub struct VolumeMapping {
     pub source: String,
     pub destination: String,
@@ -67,7 +72,7 @@ impl Display for VolumeMapping {
     }
 }
 
-#[derive(Debug, Clone, Default, Hash)]
+#[derive(Debug, Clone, Default, Hash, Deserialize)]
 pub struct Service {
     pub name: String,
     pub port: u16,
@@ -82,6 +87,25 @@ impl Service {
         let mut ret = self.clone();
         ret.env = Some(env);
         Ok(ret)
+    }
+
+    pub async fn parse_from_file(path: impl AsRef<Path>) -> ServerResult<Self> {
+        #[derive(Debug, Clone, Default, Deserialize)]
+        struct ServiceFromFile {
+            #[serde(flatten)]
+            pub service: Service,
+            pub env_file: Option<String>,
+        }
+
+        let file = fs::read(path).await?;
+        let service_file: ServiceFromFile = serde_json::from_slice(&file)?;
+
+        let mut svc = service_file.service;
+        if let Some(path) = service_file.env_file {
+            svc = svc.with_env_file(path).await?;
+        }
+
+        Ok(svc)
     }
 
     pub fn container_config(&self, ip: IpAddr) -> ServerResult<Config<String>> {
@@ -220,7 +244,7 @@ impl Runner {
                     .map(|n| n.trim().trim_start_matches('/').to_string())
             })
             .collect();
-        debug!(containers = ?container_names.iter().cloned().collect::<Vec<String>>(), "found containers");
+        trace!(containers = ?container_names.iter().cloned().collect::<Vec<String>>(), "found containers");
 
         // find services with multiple servers
         // if new server is running delete the old one(s)
@@ -278,7 +302,7 @@ impl Runner {
             .collect()
     }
 
-    fn latest_server_for_service(&self, service_name: impl Into<String>) -> Option<Server> {
+    pub fn latest_server_for_service(&self, service_name: impl Into<String>) -> Option<Server> {
         self.desired
             .servers_for_service(service_name)?
             .last()
@@ -338,11 +362,17 @@ impl Runner {
             service: service.clone(),
         };
         self.desired.insert(server);
+        debug!(server = name, "added server");
         Ok(name)
     }
 
-    /// Remove the running server from being managed
     pub fn remove(&mut self, name: impl Into<String>) -> ServerResult<bool> {
+        Ok(self.desired.remove_service(name))
+    }
+
+    /// Remove the running server from being managed
+    #[cfg(test)]
+    pub fn remove_server(&mut self, name: impl Into<String>) -> ServerResult<bool> {
         let name = name.into();
         Ok(self.desired.remove_server(&name).is_some())
     }
@@ -488,6 +518,38 @@ mod test {
             .await
             .expect("couldn't create svc with env file");
         let env = svc.env.expect("service env was empty");
+        assert_eq!(env[0], "HELLO=WORLD");
+        assert_eq!(env[1], "YES=no");
+    }
+
+    #[test(tokio::test)]
+    async fn test_service_from_file() {
+        let env_file = TempFile::new().await.expect("couldn't create tempfile");
+        let env_path = env_file.file_path();
+        fs::write(env_path, "HELLO=WORLD\nYES=no")
+            .await
+            .expect("couldn't write env file");
+
+        let file = TempFile::new().await.expect("couldn't create tempfile");
+        let path = file.file_path();
+        let file_json = serde_json::json!({
+            "name": "test",
+            "port": 8080,
+            "image": "nginx",
+            "env_file": env_path,
+        });
+
+        fs::write(path, file_json.to_string())
+            .await
+            .expect("couldn't write service file");
+
+        let read_svc = Service::parse_from_file(path)
+            .await
+            .expect("couldn't read service");
+        assert_eq!(read_svc.name, "test");
+        assert_eq!(read_svc.port, 8080);
+        assert_eq!(read_svc.image, "nginx");
+        let env = read_svc.env.expect("service env was empty");
         assert_eq!(env[0], "HELLO=WORLD");
         assert_eq!(env[1], "YES=no");
     }
@@ -703,7 +765,7 @@ mod test {
         let containers = runner.list_containers().await.unwrap();
         assert_eq!(containers.len(), 1);
 
-        runner.remove(&name).expect("couldn't remove server");
+        runner.remove_server(&name).expect("couldn't remove server");
         for _ in 0..40 {
             let _ = runner
                 .reconcile()
@@ -763,7 +825,7 @@ mod test {
             .expect("didn't find active server");
         assert_eq!(active_server.name, name_2);
 
-        runner.remove(&name).expect("couldn't remove server");
+        runner.remove_server(&name).expect("couldn't remove server");
         for _ in 0..40 {
             let _ = runner
                 .reconcile()
@@ -779,7 +841,9 @@ mod test {
         let containers = runner.list_containers().await.unwrap();
         assert_eq!(containers.len(), 1);
 
-        runner.remove(&name_2).expect("couldn't remove server");
+        runner
+            .remove_server(&name_2)
+            .expect("couldn't remove server");
         for _ in 0..40 {
             let _ = runner
                 .reconcile()
