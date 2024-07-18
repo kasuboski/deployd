@@ -84,7 +84,7 @@ mod test {
 
         state.insert(server);
         assert!(state.get_server("test-1").is_some());
-        assert!(state.servers().find(|ns| ns.contains("test-1")).is_some());
+        assert!(state.servers().any(|ns| ns.contains("test-1")));
     }
 
     #[test]
@@ -105,7 +105,7 @@ mod test {
 
         state.insert(server);
         assert!(state.get_server("test-1").is_some());
-        assert!(state.servers().find(|ns| ns.contains("test-1")).is_some());
+        assert!(state.servers().any(|ns| ns.contains("test-1")));
 
         let server_b = Server {
             name: "test-2".into(),
@@ -114,13 +114,13 @@ mod test {
         };
         state.insert(server_b);
         assert!(state.get_server("test-2").is_some());
-        assert!(state.servers().find(|ns| ns.contains("test-2")).is_some());
+        assert!(state.servers().any(|ns| ns.contains("test-2")));
 
         assert!(state.remove_server("test-1").is_some());
-        assert!(state.servers().find(|ns| ns.contains("test-1")).is_none());
+        assert!(!state.servers().any(|ns| ns.contains("test-1")));
 
         assert!(state.remove_server("test-2").is_some());
-        assert!(state.servers().find(|ns| ns.contains("test-2")).is_none());
+        assert!(!state.servers().any(|ns| ns.contains("test-2")));
 
         assert_eq!(state.server_names().count(), 0);
     }

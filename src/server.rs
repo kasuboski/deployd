@@ -1,9 +1,11 @@
+use bollard::auth::DockerCredentials;
 use bollard::container::Config;
 use bollard::container::CreateContainerOptions;
 use bollard::container::ListContainersOptions;
 use bollard::container::RemoveContainerOptions;
 use bollard::container::StartContainerOptions;
 use bollard::container::StopContainerOptions;
+use bollard::image::CreateImageOptions;
 use bollard::secret::ContainerSummary;
 use bollard::secret::HostConfig;
 use bollard::secret::Mount;
@@ -12,6 +14,8 @@ use bollard::secret::PortBinding;
 use bollard::secret::RestartPolicy;
 use bollard::secret::RestartPolicyNameEnum;
 use fasthash::MetroHasher;
+use futures::TryStreamExt;
+use serde_json::Value;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -40,6 +44,8 @@ pub enum ServerError {
     ServerNotFound(String),
     #[error("the server didn't get an ip before trying to run")]
     ServerMissingIP,
+    #[error("unable to parse the image: {0}")]
+    ImageParseFailure(String),
 }
 
 type ServerResult<T> = Result<T, ServerError>;
@@ -311,7 +317,8 @@ impl Runner {
         });
         let ip = server.addr.ok_or(ServerError::ServerMissingIP)?.ip();
         let config = server.service.container_config(ip)?;
-        // TODO: need to ensure the image exists
+
+        let _ = self.pull_image(server.service.image.clone()).await;
         self.docker.create_container(options, config).await?;
         self.docker
             .start_container(&name, None::<StartContainerOptions<String>>)
@@ -337,6 +344,7 @@ impl Runner {
             service: service.clone(),
         };
         self.desired.insert(server);
+        let _ = self.pull_image(service.image.clone());
         Ok(name)
     }
 
@@ -410,6 +418,35 @@ impl Runner {
 
         Ok(containers)
     }
+
+    async fn pull_image(&self, image: impl Into<String>) -> ServerResult<()> {
+        let image = image.into();
+        // This probably won't correctly for shas
+        let (repo, tag) = image.split_once(":").unwrap_or_else(|| (&image, "latest"));
+        let options = CreateImageOptions {
+            from_image: image.clone(),
+            tag: tag.to_owned(),
+            ..Default::default()
+        };
+        let creds = read_docker_credentials(repo).await;
+        let stream = self.docker.create_image(Some(options), None, creds);
+        stream.try_collect::<Vec<_>>().await?;
+        Ok(())
+    }
+}
+
+async fn read_docker_credentials(repo: impl Into<String>) -> Option<DockerCredentials> {
+    let mut home = dirs::home_dir()?;
+    let contents = fs::read(home).await.ok()?;
+    let config: Value = serde_json::from_slice(&contents).ok()?;
+    let auths = config.get("auths")?;
+    let repo_creds = auths.get(repo.into())?;
+    let auth: HashMap<String, String> = serde_json::from_value(repo_creds.clone()).ok()?;
+    let auth = auth.get("auth").cloned();
+    Some(DockerCredentials {
+        auth,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -579,12 +616,22 @@ mod test {
 
     #[ignore]
     #[test(tokio::test)]
+    async fn test_pull_image() {
+        let runner = Runner::new().expect("couldn't create runner");
+        runner
+            .pull_image("tianon/toybox")
+            .await
+            .expect("couldn't pull image");
+    }
+
+    #[ignore]
+    #[test(tokio::test)]
     async fn test_run_server() {
         let mut runner = Runner::new().expect("couldn't create runner");
         let svc = Service {
             name: "test".to_string(),
             port: 8080,
-            image: "nginx".to_string(),
+            image: "tianon/toybox".to_string(),
             env: None,
             volume_mapping: None,
         };
@@ -596,7 +643,7 @@ mod test {
             .await
             .expect("error finding container");
         let image = info.image.expect("no image found");
-        assert!(image.contains("nginx"));
+        assert!(image.contains(&svc.image));
 
         let container_names = info.names.expect("no names found");
         let container_name = container_names.first().expect("didn't find first name");
