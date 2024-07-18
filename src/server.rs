@@ -210,18 +210,7 @@ impl Runner {
         })
     }
 
-    /// Maintain the containers that are running in their state
-    pub async fn execute(&mut self) {
-        // TODO: end gracefully at some point
-        loop {
-            match self.reconcile().await {
-                Ok(_) => (),
-                Err(_) => continue,
-            }
-        }
-    }
-
-    async fn reconcile(&mut self) -> ServerResult<()> {
+    pub async fn reconcile(&mut self) -> ServerResult<()> {
         // List containers we are managing
         let mut container_names: HashSet<String> = self
             .list_containers()
@@ -230,7 +219,7 @@ impl Runner {
             .filter_map(|cs| {
                 cs.names?
                     .first()
-                    .map(|n| n.trim().trim_start_matches("/").to_string())
+                    .map(|n| n.trim().trim_start_matches('/').to_string())
             })
             .collect();
         debug!(containers = ?container_names.iter().cloned().collect::<Vec<String>>(), "found containers");
@@ -351,7 +340,6 @@ impl Runner {
             service: service.clone(),
         };
         self.desired.insert(server);
-        let _ = self.pull_image(service.image.clone());
         Ok(name)
     }
 
@@ -429,7 +417,7 @@ impl Runner {
     async fn pull_image(&self, image: impl Into<String>) -> ServerResult<()> {
         let image = image.into();
         // This probably won't correctly for shas
-        let (repo, tag) = image.split_once(":").unwrap_or_else(|| (&image, "latest"));
+        let (repo, tag) = image.split_once(':').unwrap_or_else(|| (&image, "latest"));
         let options = CreateImageOptions {
             from_image: image.clone(),
             tag: tag.to_owned(),

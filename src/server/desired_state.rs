@@ -63,7 +63,7 @@ impl DesiredState {
         let server_name = server_name.into();
 
         let server = self.servers.remove(&server_name)?;
-        let ref service_name = server.service.name;
+        let service_name = &server.service.name;
         self.services
             .entry(service_name.into())
             .and_modify(|server_names| {

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use server::{Runner, Service};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use tokio::fs::{self};
@@ -8,7 +9,7 @@ use tracing::error;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use futures::{future, FutureExt, StreamExt, TryFutureExt};
+use futures::{future, pin_mut, FutureExt, StreamExt, TryFutureExt};
 use std::env;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -29,6 +30,21 @@ async fn main() -> Result<()> {
     let listen_addr = env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+
+    let runner = Arc::new(Mutex::new(Runner::new().expect("couldn't create runner")));
+    let runner_reconcile = runner.clone();
+    let reconcile_stream = IntervalStream::new(time::interval(Duration::from_millis(250)))
+        .for_each(|_| {
+            let value = &runner_reconcile;
+            async move {
+                let runner = value.clone();
+                let mut guard = runner.lock().await;
+                match guard.reconcile().await {
+                    Ok(_) => (),
+                    Err(e) => error!(error = ?e, "error during reconcile"),
+                };
+            }
+        });
 
     let server = config_server().await.expect("couldn't read server file");
     let active_server: Arc<Mutex<SocketAddr>> = Arc::new(Mutex::new(server));
@@ -60,7 +76,12 @@ async fn main() -> Result<()> {
             })
             .await
     });
-    future::select(Box::pin(config_stream), Box::pin(handler_stream)).await;
+    future::join3(
+        Box::pin(config_stream),
+        Box::pin(handler_stream),
+        Box::pin(reconcile_stream),
+    )
+    .await;
 
     Ok(())
 }
