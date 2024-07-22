@@ -164,7 +164,13 @@ impl Service {
 
 pub async fn read_env_file(path: impl AsRef<Path>) -> ServerResult<Vec<String>> {
     let read = fs::read_to_string(path).await?;
-    let lines = read.split('\n').map(|l| l.to_owned()).collect::<Vec<_>>();
+    let lines = read.split('\n').filter_map(|l| {
+        if l != "" {
+            Some(l.to_owned())
+        } else {
+            None
+        }
+    }).collect::<Vec<_>>();
 
     Ok(lines)
 }
@@ -493,6 +499,7 @@ mod test {
             .await
             .expect("couldn't write env file");
         let envs = read_env_file(path).await.expect("couldn't read env file");
+        assert_eq!(envs.len(), 2);
         assert_eq!(envs[0], "HELLO=WORLD");
         assert_eq!(envs[1], "YES=no");
     }
@@ -517,6 +524,7 @@ mod test {
             .await
             .expect("couldn't create svc with env file");
         let env = svc.env.expect("service env was empty");
+        assert_eq!(env.len(), 2);
         assert_eq!(env[0], "HELLO=WORLD");
         assert_eq!(env[1], "YES=no");
     }
