@@ -14,7 +14,6 @@ use bollard::secret::PortBinding;
 use bollard::secret::RestartPolicy;
 use bollard::secret::RestartPolicyNameEnum;
 
-use fasthash::MetroHasher;
 use futures::TryStreamExt;
 use serde::Deserialize;
 use serde_json::Value;
@@ -204,8 +203,8 @@ struct Identifier;
 
 impl Identifier {
     fn get(svc: &Service) -> String {
-        use std::hash::{Hash, Hasher};
-        let mut h = MetroHasher::default();
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::default();
         svc.hash(&mut h);
         let ret = h.finish();
         bs58::encode(ret.to_le_bytes()).into_string()
