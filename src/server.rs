@@ -164,13 +164,16 @@ impl Service {
 
 pub async fn read_env_file(path: impl AsRef<Path>) -> ServerResult<Vec<String>> {
     let read = fs::read_to_string(path).await?;
-    let lines = read.split('\n').filter_map(|l| {
-        if l != "" {
-            Some(l.to_owned())
-        } else {
-            None
-        }
-    }).collect::<Vec<_>>();
+    let lines = read
+        .split('\n')
+        .filter_map(|l| {
+            if !l.is_empty() {
+                Some(l.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
 
     Ok(lines)
 }
