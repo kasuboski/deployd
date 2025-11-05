@@ -29,9 +29,13 @@ use tracing::trace;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::time::Instant;
 
+pub mod commands;
 pub mod desired_state;
 
+use self::commands::{DockerCommand, DockerEvent, ReconcileActions};
 use self::desired_state::DesiredState;
 
 #[derive(Debug, Error)]
@@ -221,38 +225,160 @@ impl Identifier {
 }
 
 #[derive(Debug, Clone)]
+struct ContainerMetadata {
+    created_at: Option<Instant>,
+    started_at: Option<Instant>,
+    replaced_at: Option<Instant>,
+}
+
+impl Default for ContainerMetadata {
+    fn default() -> Self {
+        Self {
+            created_at: None,
+            started_at: None,
+            replaced_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Runner {
     ips: IpProvisioner,
     desired: DesiredState,
-    docker: bollard::Docker,
+    pending_commands: VecDeque<DockerCommand>,
+    container_metadata: HashMap<String, ContainerMetadata>,
+    last_container_list: HashSet<String>,
+    reconcile_needed: bool,
 }
 
 impl Runner {
     pub fn new() -> ServerResult<Self> {
-        let docker = bollard::Docker::connect_with_defaults()?;
         let desired = DesiredState::default();
         let ips = IpProvisioner::default();
 
         Ok(Self {
             ips,
-            docker,
             desired,
+            pending_commands: VecDeque::new(),
+            container_metadata: HashMap::new(),
+            last_container_list: HashSet::new(),
+            reconcile_needed: false,
         })
     }
 
-    pub async fn reconcile(&mut self) -> ServerResult<()> {
-        // List containers we are managing
-        let mut container_names: HashSet<String> = self
-            .list_containers()
-            .await?
-            .into_iter()
-            .filter_map(|cs| {
-                cs.names?
-                    .first()
-                    .map(|n| n.trim().trim_start_matches('/').to_string())
+    /// Poll for the next command to execute
+    pub fn poll_command(&mut self) -> Option<DockerCommand> {
+        self.pending_commands.pop_front()
+    }
+
+    /// Handle an event from the Docker daemon
+    pub fn handle_event(&mut self, event: DockerEvent, now: Instant) {
+        match event {
+            DockerEvent::ContainersListed { containers } => {
+                self.last_container_list = containers
+                    .into_iter()
+                    .filter_map(|cs| {
+                        cs.names?
+                            .first()
+                            .map(|n| n.trim().trim_start_matches('/').to_string())
+                    })
+                    .collect();
+                trace!(containers = ?self.last_container_list.iter().cloned().collect::<Vec<String>>(), "found containers");
+                self.reconcile_needed = true;
+            }
+            DockerEvent::ImagePulled { image: _ } => {
+                // Continue with next command
+            }
+            DockerEvent::ContainerCreated { name } => {
+                if let Some(metadata) = self.container_metadata.get_mut(&name) {
+                    metadata.created_at = Some(now);
+                } else {
+                    self.container_metadata.insert(
+                        name,
+                        ContainerMetadata {
+                            created_at: Some(now),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            DockerEvent::ContainerStarted { name } => {
+                if let Some(metadata) = self.container_metadata.get_mut(&name) {
+                    metadata.started_at = Some(now);
+                }
+            }
+            DockerEvent::ContainerStopped { name: _ } => {
+                // Continue with removal
+            }
+            DockerEvent::ContainerRemoved { name } => {
+                self.container_metadata.remove(&name);
+                if let Some(s) = self.desired.remove_server(&name) {
+                    if let Some(addr) = s.addr {
+                        if let IpAddr::V4(ip) = addr.ip() {
+                            self.release_ip(ip);
+                        }
+                    }
+                }
+            }
+            DockerEvent::Error { context, error } => {
+                tracing::error!(context = context, error = ?error, "docker operation failed");
+            }
+        }
+    }
+
+    /// Handle timeout - check for time-based actions
+    pub fn handle_timeout(&mut self, now: Instant) {
+        // Check for old containers to remove (30s grace period after replacement)
+        let to_stop: Vec<String> = self
+            .container_metadata
+            .iter()
+            .filter_map(|(name, metadata)| {
+                metadata.replaced_at.and_then(|t| {
+                    if now.duration_since(t).as_secs() >= 30 {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })
             })
             .collect();
-        trace!(containers = ?container_names.iter().cloned().collect::<Vec<String>>(), "found containers");
+
+        for name in to_stop {
+            debug!(container = name, "stopping old container after grace period");
+            self.pending_commands
+                .push_back(DockerCommand::StopContainer {
+                    name: name.clone(),
+                    timeout: 30,
+                });
+            self.pending_commands
+                .push_back(DockerCommand::RemoveContainer { name });
+        }
+    }
+
+    /// Poll for next timeout
+    pub fn poll_timeout(&self) -> Option<Instant> {
+        self.container_metadata
+            .values()
+            .filter_map(|m| m.replaced_at)
+            .map(|t| t + std::time::Duration::from_secs(30))
+            .min()
+    }
+
+    /// Request reconciliation on next poll_command
+    pub fn request_reconcile(&mut self) {
+        self.reconcile_needed = true;
+        self.pending_commands
+            .push_back(DockerCommand::ListContainers);
+    }
+
+    /// Plan what actions need to be taken during reconciliation (pure logic)
+    pub fn plan_reconcile(&mut self, now: Instant) -> ReconcileActions {
+        if !self.reconcile_needed {
+            return ReconcileActions::default();
+        }
+
+        let container_names = self.last_container_list.clone();
+        let mut actions = ReconcileActions::default();
 
         // find services with multiple servers
         // if new server is running delete the old one(s)
@@ -260,35 +386,83 @@ impl Runner {
         if !to_remove.is_empty() {
             debug!(servers = ?to_remove, "found old versions of servers to remove");
         }
-        for s in to_remove {
-            self.desired.remove_server(s);
+
+        // Mark old servers as replaced
+        for name in &to_remove {
+            if let Some(metadata) = self.container_metadata.get_mut(name) {
+                metadata.replaced_at = Some(now);
+            }
         }
 
+        actions.to_remove = to_remove;
+
         // compare with desired containers
-        let mut not_found: Vec<String> = Vec::with_capacity(container_names.len());
+        let mut not_found: Vec<String> = Vec::new();
         for name in self.desired.server_names() {
-            let found = container_names.remove(name);
-            if !found {
+            if !container_names.contains(name) {
                 not_found.push(name.to_string())
             }
         }
-        // stop extras
-        for n in &container_names {
-            debug!(container = n, "stopping container");
-            self.stop(n).await?;
-        }
-        // create nonexistent
-        for nf in &not_found {
-            if self.desired.get_server(nf).is_none() {
-                // This shouldn't happen as we specifically iterated through containers
-                // to get the not_found
-                continue;
-            };
-            debug!(container = nf, "starting container");
-            self.run_server(nf).await?;
+
+        // Find extra containers to stop
+        for name in &container_names {
+            if !self.desired.server_names().any(|n| n == name) {
+                actions.to_stop.push(name.clone());
+            }
         }
 
-        Ok(())
+        actions.to_create = not_found;
+        self.reconcile_needed = false;
+
+        actions
+    }
+
+    /// Execute reconciliation actions by emitting commands
+    pub fn execute_reconcile(&mut self, actions: ReconcileActions) {
+        // Remove old servers from state
+        for name in actions.to_remove {
+            self.desired.remove_server(name);
+        }
+
+        // Stop extra containers
+        for name in &actions.to_stop {
+            debug!(container = name, "stopping container");
+            self.pending_commands
+                .push_back(DockerCommand::StopContainer {
+                    name: name.clone(),
+                    timeout: 30,
+                });
+            self.pending_commands
+                .push_back(DockerCommand::RemoveContainer {
+                    name: name.clone(),
+                });
+        }
+
+        // Create missing containers
+        for name in &actions.to_create {
+            if let Some(server) = self.desired.get_server(name) {
+                debug!(container = name, "starting container");
+                let ip = server.addr.expect("server should have addr").ip();
+                let config = server
+                    .service
+                    .container_config(ip)
+                    .expect("failed to create config");
+
+                self.pending_commands
+                    .push_back(DockerCommand::PullImage {
+                        image: server.service.image.clone(),
+                    });
+                self.pending_commands
+                    .push_back(DockerCommand::CreateContainer {
+                        name: name.clone(),
+                        config,
+                    });
+                self.pending_commands
+                    .push_back(DockerCommand::StartContainer {
+                        name: name.clone(),
+                    });
+            }
+        }
     }
 
     // old servers are attached to a service and have a newer version running
@@ -330,27 +504,6 @@ impl Runner {
         format!("deployd-{}-{}", name, identifier)
     }
 
-    async fn run_server(&mut self, name: impl Into<String>) -> ServerResult<()> {
-        let name = name.into();
-        let server = self
-            .desired
-            .get_server(&name)
-            .ok_or(ServerError::ServerNotFound(name.clone()))?;
-
-        let options = Some(CreateContainerOptions {
-            name: &name,
-            platform: None,
-        });
-        let ip = server.addr.ok_or(ServerError::ServerMissingIP)?.ip();
-        let config = server.service.container_config(ip)?;
-
-        let _ = self.pull_image(server.service.image.clone()).await;
-        self.docker.create_container(options, config).await?;
-        self.docker
-            .start_container(&name, None::<StartContainerOptions<String>>)
-            .await?;
-        Ok(())
-    }
 
     /// Add the service to be run
     pub fn add(&mut self, service: &Service) -> ServerResult<String> {
@@ -384,85 +537,105 @@ impl Runner {
         let name = name.into();
         Ok(self.desired.remove_server(&name).is_some())
     }
+}
 
-    /// Stop with the given name. Return whether or not it was actually stopped
-    async fn stop(&mut self, name: impl Into<String>) -> ServerResult<bool> {
-        let name = name.into();
-        if self.find_container(&name).await.is_none() {
-            self.remove_container(&name);
-            return Ok(false);
-        }
+/// Execute a Docker command and return the result as an event
+pub async fn execute_docker_command(
+    docker: &bollard::Docker,
+    command: DockerCommand,
+) -> DockerEvent {
+    use bollard::image::CreateImageOptions;
+    use bollard::container::{CreateContainerOptions, StartContainerOptions, StopContainerOptions, RemoveContainerOptions, ListContainersOptions};
 
-        // TODO: there's probably an issue if the container fails to stop or remove...
-        let options = Some(StopContainerOptions { t: 30 });
-        self.docker.stop_container(&name, options).await?;
-        let options = Some(RemoveContainerOptions {
-            force: true,
-            ..Default::default()
-        });
-        self.docker.remove_container(&name, options).await?;
+    match command {
+        DockerCommand::ListContainers => {
+            let filters = HashMap::from([("label".to_string(), vec!["managed-by=deployd".to_string()])]);
+            let options = Some(ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            });
 
-        Ok(self.remove_container(&name))
-    }
-
-    fn remove_container(&mut self, name: impl Into<String>) -> bool {
-        let name = name.into();
-        if let Some(s) = self.desired.remove_server(&name) {
-            if let Some(addr) = s.addr {
-                if let IpAddr::V4(ip) = addr.ip() {
-                    self.release_ip(ip);
-                }
+            match docker.list_containers(options).await {
+                Ok(containers) => DockerEvent::ContainersListed { containers },
+                Err(e) => DockerEvent::Error {
+                    context: "list_containers".to_string(),
+                    error: ServerError::DockerError(e),
+                },
             }
-            return true;
         }
-        false
-    }
+        DockerCommand::PullImage { image } => {
+            let (repo, tag) = image.split_once(':').unwrap_or_else(|| (&image, "latest"));
+            let options = CreateImageOptions {
+                from_image: image.clone(),
+                tag: tag.to_owned(),
+                ..Default::default()
+            };
+            let creds = read_docker_credentials(repo).await;
 
-    async fn find_container(&self, name: &String) -> Option<ContainerSummary> {
-        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-        filters.insert("name".to_string(), vec![name.to_string()]);
-
-        let options = Some(ListContainersOptions {
-            // only list running
-            all: false,
-            filters,
-            ..Default::default()
-        });
-        let containers = self.docker.list_containers(options).await.ok()?;
-        if containers.len() != 1 {
-            // warn!("more than one container found for name");
-            return None;
+            match docker
+                .create_image(Some(options), None, creds)
+                .try_collect::<Vec<_>>()
+                .await
+            {
+                Ok(_) => DockerEvent::ImagePulled { image },
+                Err(e) => DockerEvent::Error {
+                    context: format!("pull_image: {}", image),
+                    error: ServerError::DockerError(e),
+                },
+            }
         }
+        DockerCommand::CreateContainer { name, config } => {
+            let options = Some(CreateContainerOptions {
+                name: name.as_str(),
+                platform: None,
+            });
 
-        containers.first().cloned()
-    }
+            match docker.create_container(options, config).await {
+                Ok(_) => DockerEvent::ContainerCreated { name },
+                Err(e) => DockerEvent::Error {
+                    context: format!("create_container: {}", name),
+                    error: ServerError::DockerError(e),
+                },
+            }
+        }
+        DockerCommand::StartContainer { name } => {
+            match docker
+                .start_container(&name, None::<StartContainerOptions<String>>)
+                .await
+            {
+                Ok(_) => DockerEvent::ContainerStarted { name },
+                Err(e) => DockerEvent::Error {
+                    context: format!("start_container: {}", name),
+                    error: ServerError::DockerError(e),
+                },
+            }
+        }
+        DockerCommand::StopContainer { name, timeout } => {
+            let options = Some(StopContainerOptions { t: timeout as i64 });
 
-    async fn list_containers(&self) -> ServerResult<Vec<ContainerSummary>> {
-        let filters =
-            HashMap::from([("label".to_string(), vec!["managed-by=deployd".to_string()])]);
-        let options = Some(ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        });
-        let containers = self.docker.list_containers(options).await?;
+            match docker.stop_container(&name, options).await {
+                Ok(_) => DockerEvent::ContainerStopped { name },
+                Err(e) => DockerEvent::Error {
+                    context: format!("stop_container: {}", name),
+                    error: ServerError::DockerError(e),
+                },
+            }
+        }
+        DockerCommand::RemoveContainer { name } => {
+            let options = Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            });
 
-        Ok(containers)
-    }
-
-    async fn pull_image(&self, image: impl Into<String>) -> ServerResult<()> {
-        let image = image.into();
-        // This probably won't correctly for shas
-        let (repo, tag) = image.split_once(':').unwrap_or_else(|| (&image, "latest"));
-        let options = CreateImageOptions {
-            from_image: image.clone(),
-            tag: tag.to_owned(),
-            ..Default::default()
-        };
-        let creds = read_docker_credentials(repo).await;
-        let stream = self.docker.create_image(Some(options), None, creds);
-        stream.try_collect::<Vec<_>>().await?;
-        Ok(())
+            match docker.remove_container(&name, options).await {
+                Ok(_) => DockerEvent::ContainerRemoved { name },
+                Err(e) => DockerEvent::Error {
+                    context: format!("remove_container: {}", name),
+                    error: ServerError::DockerError(e),
+                },
+            }
+        }
     }
 }
 
@@ -680,19 +853,129 @@ mod test {
         assert_eq!(found_old.len(), 1);
     }
 
-    #[ignore]
-    #[test(tokio::test)]
-    async fn test_pull_image() {
-        let runner = Runner::new().expect("couldn't create runner");
-        runner
-            .pull_image("tianon/toybox")
-            .await
-            .expect("couldn't pull image");
+    // Test sans-IO reconciliation logic
+    #[test]
+    fn test_plan_reconcile_creates_missing_containers() {
+        let mut runner = Runner::new().expect("couldn't create runner");
+        let svc = Service {
+            name: "test".to_string(),
+            port: 8080,
+            image: "nginx".to_string(),
+            env: None,
+            volume_mapping: None,
+        };
+
+        runner.add(&svc).expect("couldn't add service");
+        runner.request_reconcile();
+
+        // Simulate container list result
+        runner.handle_event(
+            DockerEvent::ContainersListed { containers: vec![] },
+            Instant::now(),
+        );
+
+        let actions = runner.plan_reconcile(Instant::now());
+        assert_eq!(actions.to_create.len(), 1);
+        assert_eq!(actions.to_stop.len(), 0);
+    }
+
+    #[test]
+    fn test_plan_reconcile_stops_extra_containers() {
+        let mut runner = Runner::new().expect("couldn't create runner");
+        runner.request_reconcile();
+
+        // Simulate some container running that we don't want
+        let mut container = ContainerSummary::default();
+        container.names = Some(vec!["/deployd-unknown-abc".to_string()]);
+        runner.handle_event(
+            DockerEvent::ContainersListed {
+                containers: vec![container],
+            },
+            Instant::now(),
+        );
+
+        let actions = runner.plan_reconcile(Instant::now());
+        assert_eq!(actions.to_create.len(), 0);
+        assert_eq!(actions.to_stop.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_timeout_stops_old_containers() {
+        let mut runner = Runner::new().expect("couldn't create runner");
+        let now = Instant::now();
+
+        // Mark a container as replaced
+        runner.container_metadata.insert(
+            "old-container".to_string(),
+            ContainerMetadata {
+                created_at: Some(now),
+                started_at: Some(now),
+                replaced_at: Some(now),
+            },
+        );
+
+        // Advance time by 31 seconds
+        let later = now + Duration::from_secs(31);
+        runner.handle_timeout(later);
+
+        // Should have emitted stop command
+        let cmd = runner.poll_command();
+        assert!(matches!(
+            cmd,
+            Some(DockerCommand::StopContainer { name, .. }) if name == "old-container"
+        ));
+    }
+
+    #[test]
+    fn test_execute_reconcile_emits_commands() {
+        let mut runner = Runner::new().expect("couldn't create runner");
+        let svc = Service {
+            name: "test".to_string(),
+            port: 8080,
+            image: "nginx".to_string(),
+            env: None,
+            volume_mapping: None,
+        };
+
+        let name = runner.add(&svc).expect("couldn't add service");
+
+        let actions = ReconcileActions {
+            to_create: vec![name.clone()],
+            to_stop: vec![],
+            to_remove: vec![],
+        };
+
+        runner.execute_reconcile(actions);
+
+        // Should emit: PullImage, CreateContainer, StartContainer
+        let cmd1 = runner.poll_command();
+        assert!(matches!(cmd1, Some(DockerCommand::PullImage { .. })));
+
+        let cmd2 = runner.poll_command();
+        assert!(matches!(cmd2, Some(DockerCommand::CreateContainer { .. })));
+
+        let cmd3 = runner.poll_command();
+        assert!(matches!(
+            cmd3,
+            Some(DockerCommand::StartContainer { name: n }) if n == name
+        ));
     }
 
     #[ignore]
     #[test(tokio::test)]
-    async fn test_run_server() {
+    async fn test_pull_image_integration() {
+        let docker = bollard::Docker::connect_with_defaults().expect("couldn't connect to docker");
+        let cmd = DockerCommand::PullImage {
+            image: "tianon/toybox".to_string(),
+        };
+        let event = execute_docker_command(&docker, cmd).await;
+        assert!(matches!(event, DockerEvent::ImagePulled { .. }));
+    }
+
+    #[ignore]
+    #[test(tokio::test)]
+    async fn test_run_server_integration() {
+        let docker = bollard::Docker::connect_with_defaults().expect("couldn't connect to docker");
         let mut runner = Runner::new().expect("couldn't create runner");
         let svc = Service {
             name: "test".to_string(),
@@ -703,171 +986,69 @@ mod test {
         };
 
         let name = runner.add(&svc).expect("couldn't add service");
-        runner.run_server(&name).await.unwrap();
-        let info = runner
-            .find_container(&name)
-            .await
-            .expect("error finding container");
-        let image = info.image.expect("no image found");
-        assert!(image.contains(&svc.image));
 
-        let container_names = info.names.expect("no names found");
-        let container_name = container_names.first().expect("didn't find first name");
-        assert!(container_name.contains("test"));
-        assert!(container_name.contains("deployd"));
-
-        let ports = info.ports.expect("no ports found");
-        let ports = ports
-            .into_iter()
-            .filter(|p| {
-                if let Some(ip) = &p.ip {
-                    return IpAddr::from_str(ip).is_ok_and(|ip| ip.is_loopback());
-                }
-                false
-            })
-            .collect::<Vec<Port>>();
-        assert!(!ports.is_empty());
-        let port = ports.first().unwrap();
-        assert_eq!(8080, port.private_port, "private port");
-        assert_eq!(8080, port.public_port.unwrap(), "public port");
-
-        runner.stop(name).await.unwrap();
-    }
-
-    #[ignore]
-    #[test(tokio::test)]
-    async fn test_list_containers() {
-        let mut runner = Runner::new().expect("couldn't create runner");
-        let svc = Service {
-            name: "test".to_string(),
-            port: 8080,
-            image: "nginx".to_string(),
-            env: None,
-            volume_mapping: None,
+        // Execute commands
+        let actions = ReconcileActions {
+            to_create: vec![name.clone()],
+            to_stop: vec![],
+            to_remove: vec![],
         };
-        let name = runner.add(&svc).expect("couldn't add server");
-        runner.run_server(&name).await.unwrap();
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 1);
+        runner.execute_reconcile(actions);
 
-        runner.stop(name).await.unwrap();
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 0);
-    }
-
-    #[ignore]
-    #[test(tokio::test)]
-    async fn test_reconcile() {
-        let mut runner = Runner::new().expect("couldn't create runner");
-        runner.reconcile().await.expect("couldn't reconcile");
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 0);
-
-        let svc = Service {
-            name: "test".to_string(),
-            port: 8080,
-            image: "busybox".to_string(),
-            env: None,
-            volume_mapping: None,
-        };
-        let name = runner.add(&svc).expect("couldn't add service");
-        runner.reconcile().await.expect("couldn't reconcile");
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 1);
-
-        runner.remove_server(&name).expect("couldn't remove server");
-        for _ in 0..40 {
-            let _ = runner
-                .reconcile()
-                .await
-                .inspect_err(|e| error!(error = %e, "couldn't reconcile"));
-            sleep(Duration::from_secs(1)).await;
-            if let Ok(containers) = runner.list_containers().await {
-                if containers.is_empty() {
-                    break;
-                }
-            }
+        while let Some(cmd) = runner.poll_command() {
+            let event = execute_docker_command(&docker, cmd).await;
+            runner.handle_event(event, Instant::now());
         }
 
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 0);
+        // Verify container exists
+        runner.request_reconcile();
+        let cmd = runner.poll_command().expect("should have list command");
+        let event = execute_docker_command(&docker, cmd).await;
 
-        let name = runner.add(&svc).expect("couldn't add service");
-        runner.reconcile().await.expect("couldn't reconcile");
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 1);
+        if let DockerEvent::ContainersListed { containers } = event {
+            let info = containers
+                .into_iter()
+                .find(|c| {
+                    c.names
+                        .as_ref()
+                        .and_then(|names| names.first())
+                        .map(|n| n.contains(&name))
+                        .unwrap_or(false)
+                })
+                .expect("container not found");
 
-        let name_2 = runner.add(&svc).expect("couldn't add service");
-        assert_eq!(name, name_2);
+            let image = info.image.expect("no image found");
+            assert!(image.contains(&svc.image));
 
-        runner.reconcile().await.expect("couldn't reconcile");
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 1);
+            let container_names = info.names.expect("no names found");
+            let container_name = container_names.first().expect("didn't find first name");
+            assert!(container_name.contains("test"));
+            assert!(container_name.contains("deployd"));
 
-        let svc_2 = Service {
-            name: "test".to_string(),
-            port: 8080,
-            image: "nginx:1.27.0-alpine".to_string(),
-            env: None,
-            volume_mapping: None,
+            let ports = info.ports.expect("no ports found");
+            let ports = ports
+                .into_iter()
+                .filter(|p| {
+                    if let Some(ip) = &p.ip {
+                        return IpAddr::from_str(ip).is_ok_and(|ip| ip.is_loopback());
+                    }
+                    false
+                })
+                .collect::<Vec<Port>>();
+            assert!(!ports.is_empty());
+            let port = ports.first().unwrap();
+            assert_eq!(8080, port.private_port, "private port");
+            assert_eq!(8080, port.public_port.unwrap(), "public port");
+        }
+
+        // Clean up
+        let stop_cmd = DockerCommand::StopContainer {
+            name: name.clone(),
+            timeout: 10,
         };
+        execute_docker_command(&docker, stop_cmd).await;
 
-        let name_2 = runner.add(&svc_2).expect("couldn't add service");
-        assert_ne!(name, name_2);
-
-        runner.reconcile().await.expect("couldn't reconcile");
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 2);
-
-        runner.reconcile().await.expect("couldn't reconcile");
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 1);
-        assert!(containers
-            .into_iter()
-            .filter_map(|cs| {
-                cs.names?
-                    .first()
-                    .map(|n| n.trim().trim_start_matches('/').to_string())
-            })
-            .any(|c| c.contains(&name_2)));
-        let active_server = runner
-            .latest_server_for_service("test")
-            .expect("didn't find active server");
-        assert_eq!(active_server.name, name_2);
-
-        runner.remove_server(&name).expect("couldn't remove server");
-        for _ in 0..40 {
-            let _ = runner
-                .reconcile()
-                .await
-                .inspect_err(|e| error!(error = %e, "couldn't reconcile"));
-            sleep(Duration::from_secs(1)).await;
-            if let Ok(containers) = runner.list_containers().await {
-                if containers.len() == 1 {
-                    break;
-                }
-            }
-        }
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 1);
-
-        runner
-            .remove_server(&name_2)
-            .expect("couldn't remove server");
-        for _ in 0..40 {
-            let _ = runner
-                .reconcile()
-                .await
-                .inspect_err(|e| error!(error = %e, "couldn't reconcile"));
-            sleep(Duration::from_secs(1)).await;
-            if let Ok(containers) = runner.list_containers().await {
-                if containers.is_empty() {
-                    break;
-                }
-            }
-        }
-
-        let containers = runner.list_containers().await.unwrap();
-        assert_eq!(containers.len(), 0);
+        let remove_cmd = DockerCommand::RemoveContainer { name };
+        execute_docker_command(&docker, remove_cmd).await;
     }
 }
