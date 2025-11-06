@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
         .await
         .expect("couldn't parse service");
     runner.add(&svc).expect("couldn't add service");
-    let current_service = svc.name.clone();
+    let mut current_service = svc.name.clone();
 
     // Start reconciliation
     runner.request_reconcile();
@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
                             runner.remove(prev_service).ok();
                         }
                         runner.add(&svc).ok();
+                        current_service = svc.name.clone();
                     }
                     Err(e) => {
                         error!(error = ?e, "failed to parse config");
